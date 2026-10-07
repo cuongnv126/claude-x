@@ -1,0 +1,20 @@
+{
+  "name": "claude-x",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Safely merge local Claude Desktop Code sessions and groups across accounts",
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin"],
+  "scripts": {
+    "setup": "npm --prefix runtime ci",
+    "test": "node --test tests.cjs",
+    "install:global": "node install.cjs",
+    "start": "node cli.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@gitlab.com/cuongnv96/claude-x.git"
+  }
+}

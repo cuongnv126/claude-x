@@ -1,0 +1,24 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const assert=require('node:assert/strict');
+const home=os.homedir(),data=path.join(home,'.local/share/claude-x'),bin=path.join(home,'.local/bin'),launcher=path.join(bin,'claude-x');
+const quote=s=>"'"+s.replace(/'/g,"'\\''")+"'";
+fs.mkdirSync(data,{recursive:true,mode:0o700});fs.mkdirSync(bin,{recursive:true});
+if(fs.existsSync(launcher))assert(fs.readFileSync(launcher,'utf8').includes('# managed by claude-x'),'An existing claude-x command belongs to another program; it was preserved');
+const existingApp=path.join(data,'app');
+if(fs.existsSync(existingApp))assert(fs.existsSync(path.join(existingApp,'.managed.json')),'Existing installation was preserved');
+const configPath=path.join(existingApp,'config.json');
+const previousConfig=fs.existsSync(configPath)?JSON.parse(fs.readFileSync(configPath,'utf8')):{};
+const siblingLegacy=path.resolve(__dirname,'../claude-account-sync/sync-state.json');
+const legacyState=previousConfig.legacyState||(fs.existsSync(siblingLegacy)?siblingLegacy:undefined);
+assert(fs.existsSync(path.join(__dirname,'runtime/node_modules/classic-level')),'Run npm run setup before installing');
+const stage=path.join(data,'app-stage-'+process.pid);fs.mkdirSync(stage,{mode:0o700});
+for(const file of ['core.cjs','storage.cjs','tui.cjs','cli.cjs','README.md'])fs.copyFileSync(path.join(__dirname,file),path.join(stage,file));
+fs.cpSync(path.join(__dirname,'runtime'),path.join(stage,'runtime'),{recursive:true});
+const config={data,root:previousConfig.root||path.join(home,'Library/Application Support/Claude'),projects:previousConfig.projects||path.join(home,'.claude/projects'),...legacyState&&{legacyState}};
+fs.writeFileSync(path.join(stage,'config.json'),JSON.stringify(config,null,2),{mode:0o600});
+fs.writeFileSync(path.join(stage,'.managed.json'),JSON.stringify({name:'claude-x',version:'1.0.0'}),{mode:0o600});
+const app=path.join(data,'app'),previous=path.join(data,'app-previous');if(fs.existsSync(app)){assert(fs.existsSync(path.join(app,'.managed.json')),'Existing installation was preserved');fs.rmSync(previous,{recursive:true,force:true});fs.renameSync(app,previous);}fs.renameSync(stage,app);
+const body='#!/bin/sh\n# managed by claude-x\nexec '+quote(process.execPath)+' '+quote(path.join(app,'cli.cjs'))+' "$@"\n';fs.writeFileSync(launcher,body,{mode:0o700});fs.chmodSync(launcher,0o700);
+const oldLauncher=legacyState?path.join(path.dirname(legacyState),'Sync Claude Accounts.command'):path.resolve(__dirname,'../claude-account-sync/Sync Claude Accounts.command');if(fs.existsSync(oldLauncher)){const saved=oldLauncher+'.before-claude-x';if(!fs.existsSync(saved))fs.copyFileSync(oldLauncher,saved);fs.writeFileSync(oldLauncher,'#!/bin/zsh\nexec '+quote(launcher)+' "$@"\n',{mode:0o700});}
+console.log('Installed '+launcher);console.log('Run claude-x from any terminal directory.');

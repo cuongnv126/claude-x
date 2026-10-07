@@ -1,0 +1,23 @@
+node_modules/
+.DS_Store
+*.log
+coverage/
+.env
+.env.*
+
+# Local account data and generated installation/transaction files
+config.json
+.managed.json
+state.json
+sync-state.json
+sync-state-before.json
+pending.json
+pending-transaction.json
+backups/
+blobs/
+operation.lock/
+*.lock/
+app-stage-*/
+snapshot-*/
+restore-read-*/
+legacy-*/
