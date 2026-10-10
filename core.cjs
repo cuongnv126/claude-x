@@ -132,7 +132,9 @@ function normalizeGroups(value,base) {
   for(const id of Object.keys(base?.entities||{}))if(!own(entities,id))entities[id]=null;
   const assignments=Object.fromEntries(Object.entries(g.assignments||{}).filter(([k])=>k.startsWith('code:')).map(([k,v])=>[k,v]));
   for(const id of Object.keys(base?.assignments||{}))if(!own(assignments,id))assignments[id]=null;
-  const order=Object.fromEntries(Object.entries(g.order||{}).map(([k,v])=>{assert(Array.isArray(v),'Unsupported group order');return [k,v.filter(x=>typeof x==='string'&&x.startsWith('code:'))];}));
+  // Claude can retain order entries after a session is moved or unassigned.
+  // Only assigned members affect the displayed order (as in materialSections).
+  const order=Object.fromEntries(Object.entries(g.order||{}).map(([k,v])=>{assert(Array.isArray(v),'Unsupported group order');return [k,v.filter(x=>typeof x==='string'&&x.startsWith('code:')&&assignments[x]===k)];}));
   return {entities,layout:g.groups.map(x=>x.id),assignments,order};
 }
 function materialGroups(n,old={}) {

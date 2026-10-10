@@ -122,6 +122,33 @@ test('custom groups merge independent names/members, ask about assignments and s
   ctx=new C.Context();const aa=g(),bb=g();aa.assignments['code:'+sid]='g2';bb.assignments['code:'+sid]='g3';aa.groups.push({id:'g2',name:'A'});bb.groups.push({id:'g3',name:'B'});C.mergeGroups(base,scoped(aa,bb),{scopes:[A,B]},ctx);assert.ok(ctx.conflicts.some(c=>c.id.startsWith('assignment:')));
   ctx=new C.Context();C.mergeGroups({...base,entities:{g1:null},layout:[]},scoped(g(),empty()),{scopes:[B]},ctx);assert.ok(ctx.conflicts.some(c=>c.id==='group:g1'));
 });
+test('group comparison ignores stale ordering entries but retains assigned member order',()=>{
+  const first='code:'+sid,second='code:local_'+id(22),moved='code:local_'+id(23),removed='code:local_'+id(24);
+  const groups={groups:[{id:'g1',name:'Tools'},{id:'g2',name:'Done'}],assignments:{[first]:'g1',[second]:'g1',[moved]:'g2'},order:{g1:[first,second],g2:[moved]}};
+  const stale=C.clone(groups);stale.order.g1=[first,moved,removed,second,'chat:other'];
+  assert.deepEqual(C.normalizeGroups(stale),C.normalizeGroups(groups));
+  const reordered=C.clone(stale);reordered.order.g1=[second,moved,first];
+  assert.notDeepEqual(C.normalizeGroups(reordered),C.normalizeGroups(groups));
+  const reassigned=C.clone(stale);reassigned.assignments[first]='g2';
+  assert.notDeepEqual(C.normalizeGroups(reassigned),C.normalizeGroups(groups));
+});
+test('Claude retaining unused member order after restart does not block resync',async()=>{
+  const f=await fixture();try{
+    await sync(f.cfg);
+    await mutateDb(f.cfg,async db=>{
+      for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){
+        const primary=S.decode(value);
+        for(const groups of Object.values(primary.state.customGroupsByScope))groups.order.g1.push('code:local_'+id(22));
+        await db.put(key,S.encode(primary));
+      }
+    });
+    const x=await scan(f.cfg);try{
+      assert.equal(x.p.conflicts.length,0,JSON.stringify(x.p.conflicts));
+      assert.equal(x.p.sessionWrites,0);
+      assert.deepEqual(x.p.groups,x.state.groups);
+    }finally{remove(x.snap);}
+  }finally{f.cleanup();}
+});
 test('complete history extension is automatic; divergent branches preserve distinct files',async()=>{
   const f=await fixture();try{
     const cli2=id(32),p2=path.join(f.cfg.projects,'project',cli2+'.jsonl');fs.copyFileSync(f.transcript,p2);fs.appendFileSync(p2,JSON.stringify({type:'assistant',uuid:id(42),parentUuid:head,message:{content:'more'}})+'\n');
