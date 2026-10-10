@@ -48,6 +48,7 @@ class UI {
   async resolve(conflict) {
     this.heading(`Conflict: ${conflict.title}`);
     if(conflict.detail)this.info(conflict.detail);
+    for(const setting of conflict.settings||[])this.line(`  ${clean(setting.key)}: ${clean(setting.summary)}`);
     return this.choose('Confirm how to resolve it',conflict.options);
   }
   plan(plan) {

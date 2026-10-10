@@ -20,7 +20,13 @@ The Git repository contains source, tests and dependency manifests. Account reco
 
 Run `claude-x` from any terminal directory. Choose **Merge all local accounts**, or use `claude-x --sync` to start directly. If Claude Desktop is open, the command waits for you to quit it normally.
 
-New sessions and independent metadata changes merge automatically. Conflicting edits, deletions, stale account copies, changed access settings and incompatible conversation histories require your choice before anything is applied. You can cancel the whole operation. Distinct retrievable conversations can be retained as separate sidebar sessions; the command does not invent a combined transcript.
+New sessions without saved access settings and independent metadata changes merge automatically. Conflicting edits, deletions, stale account copies and incompatible conversation histories require your choice before anything is applied.
+
+A new session with saved access settings shows one confirmation listing all its protected fields together. Preserve them exactly, or explicitly remove the listed fields from every merged local copy, including the source session; removal does not select a specific permission mode. Structured settings are summarized by counts without displaying their contents. Existing-session access changes still require separate field confirmations. Unattended runs stop when any confirmation is required.
+
+You can cancel while reviewing choices without changing live data or retained backups. Distinct retrievable conversations can be retained as separate sidebar sessions; the command does not invent a combined transcript. Each resulting new session needs its own access confirmation.
+
+Keep Claude closed throughout review and applying. If the command reports that sidebar storage changed after preview, it stops before replacing live data. Rerun `claude-x` and review the fresh choices. This stop does not require recovery unless the command reports an interrupted transaction.
 
 After syncing, reopen Claude while online. All discovered local account folders are updated together. Claude saves cloud group preferences only for the signed-in account; run the command again after switching accounts to finish that account's queued group update. Additions use Claude's native migration merge to retain remote-only groups; reviewed replacements use an ordinary pending upload. No credentials are extracted and no account is logged in automatically.
 

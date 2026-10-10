@@ -1,6 +1,7 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path');
+const {PassThrough}=require('node:stream');
 const C=require('./core.cjs'),S=require('./storage.cjs');
 const {fixture,scan,sync,A,B,D,file,row,writeRow,remove,mutateDb,id,cli,head,sid,g,empty,section,scoped,baseline}=require('./fixtures.cjs');
 test('independent metadata changes merge; same-field conflicts require a choice',async()=>{
@@ -18,6 +19,102 @@ test('permissions, deletion and stale newcomer resurrection are never silent',as
 test('a new empty account cannot delete sessions; arrays are atomic',async()=>{
   const ctx=new C.Context();const r=await C.mergeSession(file,undefined,scoped(row(),null),{scopes:[]},ctx,()=>{});assert.equal(ctx.conflicts.length,0);assert.deepEqual(r.value,row());
   const arrays=new C.Context();C.mergeValue(['one'],scoped(['one','two'],['one','three']),arrays,'session.array');assert.equal(arrays.conflicts.length,1);
+});
+test('a new session reviews all saved access fields once and preserves or removes the whole bundle',async()=>{
+  const access={permissionMode:'bypassPermissions',chromePermissionMode:'auto',remoteMcpServersConfig:[{name:'private-server-name',token:'private-token'}],alwaysAllowedReasons:[],sessionPermissionUpdates:[],bypassChosenInApp:true,autoChosenInApp:false,cuAllowedApps:['Finder'],cuGrantFlags:{name:'private-grant-name',control:true}};
+  const original=row(access),observations=scoped(original,null),state={scopes:[A,B]},choice='access-import:'+file;
+  const ctx=new C.Context(),preview=await C.mergeSession(file,undefined,observations,state,ctx,()=>{throw Error('New session history should not need inspection');});
+  assert.equal(ctx.conflicts.length,1);assert.equal(ctx.conflicts[0].id,choice);
+  assert.deepEqual(ctx.conflicts[0].settings.map(s=>s.key),Object.keys(access));
+  const display=JSON.stringify(ctx.conflicts[0]);assert.ok(!/private-server-name|private-token|private-grant-name/.test(display));
+  assert.equal(ctx.conflicts[0].settings.find(s=>s.key==='cuGrantFlags').summary,'object (2 fields)');
+  assert.deepEqual(preview.value,row());assert.deepEqual(observations,scoped(original,null));
+  for(const selected of ['selected','omit']){
+    const confirmed=new C.Context({[choice]:selected}),result=await C.mergeSession(file,undefined,observations,state,confirmed,()=>{});
+    assert.equal(confirmed.conflicts.length,0);assert.deepEqual(result.value,selected==='selected'?original:row());
+  }
+  await assert.rejects(C.mergeSession(file,undefined,observations,state,new C.Context({[choice]:'invalid'}),()=>{}),/Invalid decision/);
+});
+test('new-session access confirmation preserves null, false and empty values exactly',async()=>{
+  const original=row({permissionMode:'',remoteMcpServersConfig:[],alwaysAllowedReasons:{},autoChosenInApp:false,cuGrantFlags:null});
+  const ctx=new C.Context();await C.mergeSession(file,undefined,scoped(original,null),{scopes:[A,B]},ctx,()=>{});
+  assert.equal(ctx.conflicts.length,1);
+  assert.deepEqual(Object.fromEntries(ctx.conflicts[0].settings.map(s=>[s.key,s.summary])),{permissionMode:'""',remoteMcpServersConfig:'array (0 items)',alwaysAllowedReasons:'object (0 fields)',autoChosenInApp:'false',cuGrantFlags:'null'});
+  const confirmed=new C.Context({['access-import:'+file]:'selected'});
+  const result=await C.mergeSession(file,undefined,scoped(original,null),{scopes:[A,B]},confirmed,()=>{});
+  assert.deepEqual(result.value,original);assert.equal(confirmed.conflicts.length,0);
+});
+test('existing sessions and resurrected tombstones retain their separate access checks',async()=>{
+  const base=row({permissionMode:'default',autoChosenInApp:false});
+  let ctx=new C.Context();const unchanged=await C.mergeSession(file,base,scoped(base,base),baseline(base),ctx,()=>{});
+  assert.equal(ctx.conflicts.length,0);assert.deepEqual(unchanged.value,base);
+  const changed={...base,permissionMode:'bypassPermissions'};ctx=new C.Context();
+  await C.mergeSession(file,base,scoped(changed,base),baseline(base),ctx,()=>{});
+  assert.deepEqual(ctx.conflicts.map(c=>c.id),['access:'+file+'.permissionMode']);
+  ctx=new C.Context({['access:'+file+'.permissionMode']:'selected'});
+  const selected=await C.mergeSession(file,base,scoped(changed,base),baseline(base),ctx,()=>{});
+  assert.equal(ctx.conflicts.length,0);assert.deepEqual(selected.value,changed);
+  ctx=new C.Context();await C.mergeSession(file,null,scoped(changed,null),{scopes:[A,B]},ctx,()=>{});
+  assert.ok(ctx.conflicts.some(c=>c.id==='session:'+file));assert.ok(ctx.conflicts.some(c=>c.id==='access:'+file+'.permissionMode'));
+  assert.ok(!ctx.conflicts.some(c=>c.id.startsWith('access-import:')));
+});
+test('each preserved new branch needs its own access confirmation after the history choice',async()=>{
+  const first=row({permissionMode:'bypassPermissions'}),second=row({cliSessionId:id(32),chromeAllowedDomains:['example.test']});
+  const observations=scoped(first,second),state={scopes:[A,B]},inspect=async()=>({kind:'diverged',retrievable:true});
+  let ctx=new C.Context();await C.mergeSession(file,undefined,observations,state,ctx,inspect);
+  assert.equal(ctx.conflicts[0].id,'history:'+file);
+  ctx=new C.Context({['history:'+file]:'v1'});await C.mergeSession(file,undefined,observations,state,ctx,inspect);
+  assert.deepEqual(ctx.conflicts[0].settings,[{key:'chromeAllowedDomains',summary:'array (1 items)'}]);
+  const historyChoice={['history:'+file]:'both'};ctx=new C.Context(historyChoice);
+  const preview=await C.mergeSession(file,undefined,observations,state,ctx,inspect);
+  assert.equal(preview.extras.length,1);assert.equal(ctx.conflicts.length,2);
+  const extraFile=preview.extras[0].file;
+  assert.deepEqual(ctx.conflicts.map(c=>c.id),['access-import:'+file,'access-import:'+extraFile]);
+  ctx=new C.Context({...historyChoice,['access-import:'+file]:'selected'});
+  const partial=await C.mergeSession(file,undefined,observations,state,ctx,inspect);
+  assert.equal(partial.value.permissionMode,'bypassPermissions');assert.equal(partial.extras[0].value.chromeAllowedDomains,undefined);
+  assert.deepEqual(ctx.conflicts.map(c=>c.id),['access-import:'+extraFile]);assert.equal(partial.extras[0].file,extraFile);
+  ctx=new C.Context({...historyChoice,['access-import:'+file]:'omit',['access-import:'+extraFile]:'selected'});
+  const result=await C.mergeSession(file,undefined,observations,state,ctx,inspect);
+  assert.equal(ctx.conflicts.length,0);assert.equal(result.value.permissionMode,undefined);
+  assert.deepEqual(result.extras[0].value.chromeAllowedDomains,['example.test']);assert.equal(result.extras[0].value.cliSessionId,id(32));
+});
+test('a confirmed new-session access bundle persists to every account and is not prompted again',async()=>{
+  for(const choice of ['selected','omit']){
+    const f=await fixture({one:true});try{
+      const original=row({permissionMode:'bypassPermissions',autoChosenInApp:false,alwaysAllowedReasons:[]});writeRow(f.cfg,A,original);
+      const configHash=S.fileHash(path.join(f.cfg.root,'config.json')),transcriptHash=S.fileHash(f.transcript);
+      await sync(f.cfg,{['access-import:'+file]:choice});
+      for(const scope of [A,B])assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.cfg.root,'claude-code-sessions',scope,file))),choice==='selected'?original:row());
+      const x=await scan(f.cfg);try{assert.equal(x.p.conflicts.length,0);assert.equal(x.p.sessionWrites,0);}finally{remove(x.snap);}
+      assert.equal(S.fileHash(path.join(f.cfg.root,'config.json')),configHash);assert.equal(S.fileHash(f.transcript),transcriptHash);
+    }finally{f.cleanup();}
+  }
+});
+test('rejected or cancelled access confirmation preserves live data and existing backup artifacts',async()=>{
+  const {Cancelled}=require('./tui.cjs');
+  for(const interactive of [false,true]){
+    const f=await fixture({one:true});try{
+      writeRow(f.cfg,A,row({permissionMode:'bypassPermissions'}));
+      const incomplete=path.join(f.cfg.data,'backups','2000-01-01T00-00-00-000Z-aaaaaaaa');fs.mkdirSync(incomplete,{recursive:true});fs.writeFileSync(path.join(incomplete,'held-original'),'preserve me');
+      const blobs=path.join(f.cfg.data,'blobs');fs.mkdirSync(blobs);fs.writeFileSync(path.join(blobs,'a'.repeat(64)+'.gz'),'unreferenced backup artifact');
+      const live=S.tree(f.cfg.root),data=S.tree(f.cfg.data),transcriptHash=S.fileHash(f.transcript);
+      const ui={interactive,info(){},plan(p){assert.equal(p.conflicts.length,1);},async resolve(){throw new Cancelled();}};
+      await assert.rejects(require('./cli.cjs').runOperation(f.cfg,ui,'sync'),interactive?Cancelled:/1 conflict\(s\) need confirmation/);
+      assert.deepEqual(S.tree(f.cfg.root),live);assert.deepEqual(S.tree(f.cfg.data),data);assert.equal(S.fileHash(f.transcript),transcriptHash);
+    }finally{f.cleanup();}
+  }
+});
+test('the bundled access prompt renders each sanitized setting without nested secrets',async()=>{
+  const {UI}=require('./tui.cjs'),input=new PassThrough(),output=new PassThrough();input.isTTY=true;
+  let text='';output.on('data',chunk=>{text+=chunk.toString();});const ui=new UI({input,output,color:false});
+  try{
+    const ctx=new C.Context();await C.mergeSession(file,undefined,scoped(row({permissionMode:'bypassPermissions\n\x1b[31m',remoteMcpServersConfig:[{token:'nested-secret'}],cuGrantFlags:{name:'hidden-name'}}),null),{scopes:[A,B]},ctx,()=>{});
+    const choice=ui.resolve(ctx.conflicts[0]);input.end('1\n');assert.equal(await choice,'selected');
+    const lines=text.split('\n');for(const setting of ctx.conflicts[0].settings)assert.ok(lines.includes('  '+setting.key+': '+setting.summary));
+    assert.ok(!/nested-secret|hidden-name/.test(text));assert.ok(!/[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(text));
+    assert.match(text,/Remove these access settings from all merged copies/);assert.match(text,/source session/);assert.match(text,/does not choose a specific permission mode/);
+  }finally{ui.close();input.destroy();output.destroy();}
 });
 test('custom groups merge independent names/members, ask about assignments and stale deletion',()=>{
   const base=C.normalizeGroups(g());let ctx=new C.Context();const a=g('Renamed'),b=g();b.groups.push({id:'g2',name:'New'});b.assignments['code:'+id(22)]='g2';b.order.g2=['code:'+id(22)];
@@ -102,6 +199,24 @@ test('interrupted replacement supports rollback or verified finish, protects pen
     S.atomic(path.join(f.cfg.root,'config.json'),{lastKnownAccountUuid:id(2)});await assert.rejects(S.recover(f.cfg,'rollback'),/Account changed/);S.atomic(path.join(f.cfg.root,'config.json'),{lastKnownAccountUuid:id(1),unrelated:'login'});
     await S.recover(f.cfg,'rollback');assert.deepEqual(S.tree(f.cfg.root),before);
     await assert.rejects(sync(f.cfg,{}, {failAfter:3,leaveInterrupted:true}),/Injected/);await S.recover(f.cfg,'finish');assert.equal(JSON.parse(fs.readFileSync(path.join(f.cfg.root,'claude-code-sessions',B,file))).title,'Rename');
+  }finally{f.cleanup();}
+});
+test('sidebar drift rejects a stale preview with retry guidance and a fresh preview preserves newer unrelated values',async()=>{
+  const f=await fixture();try{
+    await sync(f.cfg);const stale=await scan(f.cfg),beforeState=S.fileHash(path.join(f.cfg.data,'state.json')),beforeBackups=S.tree(path.join(f.cfg.data,'backups'));
+    const key=Buffer.from('_https://claude.ai\0\x01authentication-cache','latin1');
+    await mutateDb(f.cfg,db=>db.put(key,Buffer.from('newer-login-cache')));
+    const newerLive=S.tree(f.cfg.root);
+    try{
+      await assert.rejects(S.transaction(f.cfg,stale.snap,stale.state,stale.p),error=>{
+        assert.match(error.message,/Sidebar storage changed after preview/);assert.match(error.message,/No sync changes were applied/);assert.match(error.message,/rerun claude-x/);
+        assert.ok(!/actual - expected|MANIFEST-|\.ldb|\.log/.test(error.message));return true;
+      });
+    }finally{remove(stale.snap);}
+    assert.deepEqual(S.tree(f.cfg.root),newerLive);assert.equal(S.fileHash(path.join(f.cfg.data,'state.json')),beforeState);
+    assert.deepEqual(S.tree(path.join(f.cfg.data,'backups')),beforeBackups);assert.ok(!fs.existsSync(path.join(f.cfg.data,'pending.json')));
+    await sync(f.cfg);
+    const db=await S.readDb(path.join(f.cfg.root,'Local Storage/leveldb'));assert.equal(db.entries.get(key.toString('hex')).toString(),'newer-login-cache');
   }finally{f.cleanup();}
 });
 test('external edits and corrupt deduplicated backup blobs stop before live replacement',async()=>{

@@ -12,10 +12,12 @@ const activity=new Set(['lastActivityAt','lastFocusedAt','latestUserFrameAt']);
 const conversationKeys=new Set(['cliSessionId','unarchivedCliSessionId','preClearCliSessionId','priorCliSessionIds','lastAssistantUuid','completedTurns','postTurnSummary','postTurnSummaryFor','turnWrapUp','titleTurn','pendingRewindTo','absorbedPastLeaf']);
 const protectedKeys=new Set(['permissionMode','chromePermissionMode','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates','bypassChosenInApp','autoChosenInApp','cuAllowedApps','cuGrantFlags','cuFlagsGrantedAt','chromeAllowedDomains','chromePermsBeforeUnsupervised','enabledMcpTools','withheldConnectorHosts']);
 function short(v){if(v===undefined)return '(not present)';if(v===null)return '(deleted / unassigned)';if(typeof v==='object'){if(typeof v.name==='string')return short(v.name);if(typeof v.title==='string')return short(v.title);return Array.isArray(v)?`${v.length} items`:`object (${Object.keys(v).length} fields)`;}return String(v).replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,140);}
+function accessSummary(v){if(v===null)return 'null';if(Array.isArray(v))return `array (${v.length} items)`;if(typeof v==='object')return `object (${Object.keys(v).length} fields)`;if(v==='')return '""';return short(v);}
 class Context {
   constructor(choices={}){this.choices=choices;this.conflicts=[];this.decisions=[];}
-  pick(id,title,detail,options,fallback) {
+  pick(id,title,detail,options,fallback,settings) {
     const conflict={id,title,detail,options:options.map(({value,...o})=>o)};
+    if(settings)conflict.settings=clone(settings);
     if(!own(this.choices,id)){this.conflicts.push(conflict);return clone(fallback);}
     const selected=options.find(o=>o.id===this.choices[id]);assert(selected,`Invalid decision for ${id}`);
     this.decisions.push({id,title,choice:selected.id});return clone(selected.value);
@@ -106,7 +108,18 @@ async function mergeSessionRaw(file,base,observations,state,ctx,inspect) {
 async function mergeSession(file,base,observations,state,ctx,inspect){
   const result=await mergeSessionRaw(file,base,observations,state,ctx,inspect);
   for(const output of [{file,value:result.value},...result.extras]){const r=output.value;if(!r||typeof r!=='object')continue;
-    for(const key of protectedKeys)if(!equal(r[key],base?.[key])){const id='access:'+output.file+'.'+key,obs=[{scope:'selected/version',value:r[key]}];
+    const keys=[...protectedKeys].filter(key=>!equal(r[key],base?.[key]));
+    if(base===undefined&&keys.length){
+      const settings=keys.map(key=>({key,summary:accessSummary(r[key])}));
+      const selected=Object.fromEntries(keys.map(key=>[key,r[key]]));
+      const value=ctx.pick('access-import:'+output.file,'Access settings for new session: '+(r.title||file),`Review ${keys.length} saved access fields together. Structured values are summarized; preserving keeps their full contents.`,[
+        {id:'selected',label:'Preserve these access settings in all merged copies',value:selected},
+        {id:'omit',label:'Remove these access settings from all merged copies',description:'Also removes them from the source session; this does not choose a specific permission mode.',value:{}}
+      ],{},settings);
+      for(const key of keys){if(own(value,key))r[key]=value[key];else delete r[key];}
+      continue;
+    }
+    for(const key of keys){const id='access:'+output.file+'.'+key;
       const options=[{id:'selected',label:'Use selected session setting: '+short(r[key]),value:r[key]},{id:'previous',label:'Keep previous access setting: '+short(base?.[key]),value:base?.[key]}];
       const value=ctx.pick(id,'Access setting: '+(r.title||file)+' / '+key,'Confirm this access-setting change separately from the history choice.',options,base?.[key]);if(value===undefined)delete r[key];else r[key]=value;
     }
