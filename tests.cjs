@@ -99,7 +99,7 @@ test('rejected or cancelled access confirmation preserves live data and existing
       const incomplete=path.join(f.cfg.data,'backups','2000-01-01T00-00-00-000Z-aaaaaaaa');fs.mkdirSync(incomplete,{recursive:true});fs.writeFileSync(path.join(incomplete,'held-original'),'preserve me');
       const blobs=path.join(f.cfg.data,'blobs');fs.mkdirSync(blobs);fs.writeFileSync(path.join(blobs,'a'.repeat(64)+'.gz'),'unreferenced backup artifact');
       const live=S.tree(f.cfg.root),data=S.tree(f.cfg.data),transcriptHash=S.fileHash(f.transcript);
-      const ui={interactive,info(){},plan(p){assert.equal(p.conflicts.length,1);},async resolve(){throw new Cancelled();}};
+      const ui={interactive,info(){},task:(label,fn)=>fn({update(){}}),plan(p){assert.equal(p.conflicts.length,1);},async resolve(){throw new Cancelled();}};
       await assert.rejects(require('./cli.cjs').runOperation(f.cfg,ui,'sync'),interactive?Cancelled:/1 conflict\(s\) need confirmation/);
       assert.deepEqual(S.tree(f.cfg.root),live);assert.deepEqual(S.tree(f.cfg.data),data);assert.equal(S.fileHash(f.transcript),transcriptHash);
     }finally{f.cleanup();}
@@ -111,10 +111,50 @@ test('the bundled access prompt renders each sanitized setting without nested se
   try{
     const ctx=new C.Context();await C.mergeSession(file,undefined,scoped(row({permissionMode:'bypassPermissions\n\x1b[31m',remoteMcpServersConfig:[{token:'nested-secret'}],cuGrantFlags:{name:'hidden-name'}}),null),{scopes:[A,B]},ctx,()=>{});
     const choice=ui.resolve(ctx.conflicts[0]);input.end('1\n');assert.equal(await choice,'selected');
-    const lines=text.split('\n');for(const setting of ctx.conflicts[0].settings)assert.ok(lines.includes('  '+setting.key+': '+setting.summary));
+    const lines=text.split('\n'),escape=v=>v.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');for(const setting of ctx.conflicts[0].settings)assert.ok(lines.some(l=>new RegExp('^│ +'+escape(setting.key)+': +'+escape(setting.summary)+'$').test(l)),setting.key);
     assert.ok(!/nested-secret|hidden-name/.test(text));assert.ok(!/[\x00-\x09\x0b-\x1f\x7f-\x9f]/.test(text));
     assert.match(text,/Remove these access settings from all merged copies/);assert.match(text,/source session/);assert.match(text,/does not choose a specific permission mode/);
   }finally{ui.close();input.destroy();output.destroy();}
+});
+test('arrow-key prompts start on the recommendation, discard stray keys and collapse into a record',async()=>{
+  const {UI,Cancelled}=require('./tui.cjs'),input=new PassThrough(),output=new PassThrough(),term=process.env.TERM;
+  Object.assign(input,{isTTY:true,setRawMode(){}});Object.assign(output,{isTTY:true,columns:80,rows:24});process.env.TERM='xterm-256color';
+  let text='';output.on('data',chunk=>{text+=chunk.toString();});const ui=new UI({input,output,color:false});
+  const tick=()=>new Promise(r=>setImmediate(r)),options=[{id:'a',label:'First'},{id:'b',label:'Second (Recommended)'},{id:'c',label:'Third'}];
+  try{
+    let choice=ui.choose('Pick one',options);input.write('\x1b[B');await tick();input.write('\r');assert.equal(await choice,'c');
+    input.write('\x1b[B\r');await tick();
+    choice=ui.choose('Pick again',options);await tick();input.write('\r');assert.equal(await choice,'b');
+    choice=ui.choose('Pick last',options);await tick();input.write('q');await assert.rejects(choice,Cancelled);
+    assert.match(text,/◇  Pick one\n│  Third\n/);assert.match(text,/◇  Pick again\n│  Second\n/);assert.match(text,/■  Pick last\n/);
+  }finally{ui.close();input.destroy();output.destroy();if(term===undefined)delete process.env.TERM;else process.env.TERM=term;}
+});
+test('the account map links every folder to the shared state and marks the signed-in account',()=>{
+  const {UI,width}=require('./tui.cjs'),output=new PassThrough();let text='';output.on('data',chunk=>{text+=chunk.toString();});
+  const ui=new UI({input:new PassThrough(),output,color:false});
+  try{
+    ui.accountMap({folders:[{scope:'aaaaaaaa/11111111',detail:'2 sessions'},{scope:'aaaaaaaa/22222222',detail:'2 sessions'},{scope:'bbbbbbbb/11111111',signedIn:true,detail:'3 sessions'}],hub:{title:'Shared',lines:[['3 sessions'],['1 group']]}});
+    const lines=text.trimEnd().split('\n').map(l=>l.replace(/^│  /,''));
+    assert.match(lines[0],/^○ aaaaaaaa ──┬─ 11111111  2 sessions ─┐ +╭─ Shared ─*╮$/);
+    assert.match(lines[1],/^ +└─ 22222222  2 sessions ─┼──▶ │ 3 sessions +│$/);
+    assert.match(lines[2],/^● bbbbbbbb ──── 11111111  3 sessions ─┘ +│ 1 group +│$/);
+    assert.match(lines[3],/^ +╰─+╯$/);assert.equal(new Set(lines.slice(0,4).map(width)).size,1);assert.match(lines[4],/current account \(signed in\)/);
+  }finally{ui.close();output.destroy();}
+});
+test('account names are learned from Claude Code or set with --name, and typed names win',async()=>{
+  const f=await fixture();try{
+    const {UI}=require('./tui.cjs'),{main}=require('./cli.cjs'),signIn=email=>fs.writeFileSync(f.cfg.claudeCode,JSON.stringify({oauthAccount:{accountUuid:id(1),emailAddress:email,organizationName:'Org'}}));
+    const run=async args=>{const output=new PassThrough(),errorOutput=new PassThrough();let text='';output.on('data',c=>{text+=c;});errorOutput.on('data',c=>{text+=c;});await main({cfg:f.cfg,ui:new UI({input:new PassThrough(),output,errorOutput,color:false}),args});return text;};
+    const stored=()=>JSON.parse(fs.readFileSync(path.join(f.cfg.data,'accounts.json'))).accounts;
+    f.cfg.claudeCode=path.join(f.dir,'claude.json');signIn('me@example.com');
+    let text=await run(['--status']);
+    assert.match(text,/● me@example\.com /);assert.match(text,/\(00000001\)/);assert.match(text,/○ 00000002 /);assert.deepEqual(stored()[id(1)],{label:'me@example.com',source:'claude-code'});
+    text=await run(['--name','00000002','work@example.com']);assert.match(text,/○ work@example\.com /);assert.equal(stored()[id(2)].source,'manual');
+    await run(['--name','00000001','Personal']);signIn('other@example.com');
+    text=await run(['--status']);assert.match(text,/● Personal /);assert.equal(stored()[id(1)].label,'Personal');
+    await assert.rejects(run(['--name','0000','x']),/several accounts/);
+    await run(['--name','00000002']);assert.equal(stored()[id(2)],undefined);
+  }finally{f.cleanup();}
 });
 test('custom groups merge independent names/members, ask about assignments and stale deletion',()=>{
   const base=C.normalizeGroups(g());let ctx=new C.Context();const a=g('Renamed'),b=g();b.groups.push({id:'g2',name:'New'});b.assignments['code:'+id(22)]='g2';b.order.g2=['code:'+id(22)];
@@ -265,7 +305,7 @@ test('preview does not prune backups or mutate live/state data',async()=>{
   const f=await fixture();try{
     await sync(f.cfg);const b=S.backupList(f.cfg)[0];const copy=path.join(f.cfg.data,'backups','2000-01-01T00-00-00-000Z-aaaaaaaa');fs.cpSync(b.path,copy,{recursive:true});const manifest=JSON.parse(fs.readFileSync(path.join(copy,'manifest.json')));manifest.id=path.basename(copy);S.atomic(path.join(copy,'manifest.json'),manifest);
     const live=S.tree(f.cfg.root),backups=S.tree(path.join(f.cfg.data,'backups')),state=S.fileHash(path.join(f.cfg.data,'state.json'));
-    const ui={info(){},plan(){},warn(){},close(){},interactive:false};await require('./cli.cjs').runOperation(f.cfg,ui,'preview');assert.deepEqual(S.tree(f.cfg.root),live);assert.deepEqual(S.tree(path.join(f.cfg.data,'backups')),backups);assert.equal(S.fileHash(path.join(f.cfg.data,'state.json')),state);
+    const ui={info(){},task:(label,fn)=>fn({update(){}}),plan(){},outro(){},warn(){},close(){},interactive:false};await require('./cli.cjs').runOperation(f.cfg,ui,'preview');assert.deepEqual(S.tree(f.cfg.root),live);assert.deepEqual(S.tree(path.join(f.cfg.data,'backups')),backups);assert.equal(S.fileHash(path.join(f.cfg.data,'state.json')),state);
   }finally{f.cleanup();}
 });
 test('corrupt state keys and tampered backed-up state are rejected',async()=>{
