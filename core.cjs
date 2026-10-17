@@ -125,17 +125,24 @@ async function mergeSession(file,base,observations,state,ctx,inspect){
     }
   }return result;
 }
-function normalizeGroups(value,base) {
+function normalizeGroups(value,base,history={}) {
   const g=value||{groups:[],assignments:{},order:{}};
   assert(Array.isArray(g.groups)&&plain(g.assignments||{})&&plain(g.order||{}),'Unsupported custom-group format');
-  const entities=Object.fromEntries(g.groups.map(x=>{assert(typeof x.id==='string'&&typeof x.name==='string','Malformed group');return [x.id,clone(x)];}));
+  const staleCopy=g.groups.some(x=>base?.entities[x.id]===null);
+  const entities=Object.fromEntries(g.groups.map(x=>{assert(typeof x.id==='string'&&typeof x.name==='string','Malformed group');const confirmed=base?.entities[x.id];return [x.id,staleCopy&&confirmed&&history[x.id]?.includes(hash(x))?clone(confirmed):clone(x)];}).filter(([id])=>base?.entities[id]!==null));
   for(const id of Object.keys(base?.entities||{}))if(!own(entities,id))entities[id]=null;
-  const assignments=Object.fromEntries(Object.entries(g.assignments||{}).filter(([k])=>k.startsWith('code:')).map(([k,v])=>[k,v]));
+  const assignments=Object.fromEntries(Object.entries(g.assignments||{}).filter(([k])=>k.startsWith('code:')).map(([k,v])=>{
+    // Claude can write old memberships back after their group was deleted. An
+    // absent, tombstoned group cannot be a new assignment. Keep the confirmed
+    // placement, if it still exists, rather than asking once for every session.
+    if(v&&!entities[v]&&base?.entities[v]===null){const confirmed=base.assignments?.[k];v=confirmed&&entities[confirmed]?confirmed:null;}
+    return [k,v];
+  }));
   for(const id of Object.keys(base?.assignments||{}))if(!own(assignments,id))assignments[id]=null;
   // Claude can retain order entries after a session is moved or unassigned.
   // Only assigned members affect the displayed order (as in materialSections).
-  const order=Object.fromEntries(Object.entries(g.order||{}).map(([k,v])=>{assert(Array.isArray(v),'Unsupported group order');return [k,v.filter(x=>typeof x==='string'&&x.startsWith('code:')&&assignments[x]===k)];}));
-  return {entities,layout:g.groups.map(x=>x.id),assignments,order};
+  const order=Object.fromEntries(Object.entries(g.order||{}).map(([k,v])=>{assert(Array.isArray(v),'Unsupported group order');return [k,v.filter(x=>typeof x==='string'&&x.startsWith('code:')&&assignments[x]===k)];}).filter(([id])=>entities[id]));
+  return {entities,layout:g.groups.filter(x=>entities[x.id]).map(x=>x.id),assignments,order};
 }
 function materialGroups(n,old={}) {
   const groups=n.layout.filter(id=>n.entities[id]).map(id=>clone(n.entities[id]));for(const [id,g]of Object.entries(n.entities))if(g&&!groups.some(x=>x.id===id))groups.push(clone(g));
@@ -153,21 +160,36 @@ function materialSections(n,groups,old) {
   return {...clone(old),...clone(n),sections,prefsSeeded:true};
 }
 function mergeGroups(base,observations,state,ctx) {
-  const normalized=observations.map(o=>({...o,value:normalizeGroups(o.value,base)}));
+  const normalized=observations.map(o=>({...o,staleCopy:o.value?.groups?.some(g=>base?.entities[g.id]===null),value:normalizeGroups(o.value,base,state.groupHistory)}));
   const relevant=normalized.filter(o=>state.scopes?.includes(o.scope)||o.value.layout.length);
   const variants=relevant.filter(o=>!equal(o.value,base));
   if(!variants.length)return clone(base);
   let result={entities:{},layout:[],assignments:{},order:{}};
   const ids=new Set([...Object.keys(base?.entities||{}),...relevant.flatMap(o=>Object.keys(o.value.entities))]);
-  for(const id of ids){const b=base?.entities?.[id];const obs=relevant.map(o=>({...o,value:own(o.value.entities,id)?o.value.entities[id]:b===undefined?undefined:null}));const deleting=b&&obs.some(o=>o.value===null);const resurrect=b===null&&obs.some(o=>o.value);const stale=base&&obs.some(o=>!state.scopes?.includes(o.scope)&&o.value!==undefined&&!equal(o.value,b));result.entities[id]=mergeValue(b,obs,ctx,'group:'+id,{force:!!deleting||resurrect||!!stale});}
-  result.layout=mergeValue(base?.layout||[],relevant.map(o=>({...o,value:o.value.layout})),ctx,'group-order',{ordered:true})||[];
+  for(const id of ids){
+    const b=base?.entities?.[id];
+    const obs=relevant.map(o=>{let value=own(o.value.entities,id)?o.value.entities[id]:b===undefined?undefined:null;if(value===null&&b&&!state.scopes?.includes(o.scope))value=b;return {...o,value};});
+    const emptyScope=b&&relevant.some(o=>o.value.entities[id]===null&&o.value.layout.length===0&&state.scopes?.includes(o.scope));
+    const stale=b!==undefined&&obs.some(o=>!state.scopes?.includes(o.scope)&&o.value!==undefined&&!equal(o.value,b));
+    const unknownMetadata=b&&relevant.some(o=>o.staleCopy&&o.value.entities[id]&&!equal(o.value.entities[id],b));
+    result.entities[id]=mergeValue(b,obs,ctx,'group:'+id,{force:!!emptyScope||!!stale||!!unknownMetadata});
+  }
+  const groupLayout=base?.layout||[];
+  result.layout=mergeValue(groupLayout,relevant.map(o=>({...o,value:state.scopes?.includes(o.scope)?o.value.layout:[...groupLayout,...o.value.layout.filter(id=>!groupLayout.includes(id))]})),ctx,'group-order',{ordered:true})||[];
   ctx.groupNames=Object.fromEntries(Object.entries(result.entities).filter(([,g])=>g).map(([id,g])=>[id,g.name]));
   const members=new Set([...Object.keys(base?.assignments||{}),...relevant.flatMap(o=>Object.keys(o.value.assignments))]);
-  for(const key of members){const b=base?.assignments?.[key];const obs=relevant.map(o=>({...o,value:own(o.value.assignments,key)?o.value.assignments[key]:b===undefined?undefined:null}));const stale=b!==undefined&&obs.some(o=>!state.scopes?.includes(o.scope)&&o.value!==undefined&&!equal(o.value,b));const v=mergeValue(b,obs,ctx,'assignment:'+key,{force:stale});if(v!==undefined)result.assignments[key]=v;}
-  for(const id of new Set([...Object.keys(base?.order||{}),...relevant.flatMap(o=>Object.keys(o.value.order))]))result.order[id]=mergeValue(base?.order?.[id]||[],relevant.map(o=>({...o,value:o.value.order[id]||[]})),ctx,'member-order:'+id,{ordered:true})||[];
-  for(const [key,id]of Object.entries(result.assignments))if(id&&!result.entities[id]){const choices=[{id:'clear',label:'Leave the session ungrouped',value:null},...Object.entries(result.entities).filter(([,g])=>g).map(([id,g])=>({id,label:'Move to '+g.name,value:id}))];const oldGroup=relevant.map(o=>o.value.entities[id]).find(Boolean);if(oldGroup)choices.push({id:'restore',label:'Restore group '+oldGroup.name,value:'__restore'});const chosen=ctx.pick('orphan:'+key,'Assignment references a removed group',key,choices,null);if(chosen==='__restore'){result.entities[id]=clone(oldGroup);result.assignments[key]=id;}else result.assignments[key]=chosen;}
+  for(const key of members){let b=base?.assignments?.[key];if(b&&base?.entities[b]===null)b=null;const obs=relevant.map(o=>{let value=own(o.value.assignments,key)?o.value.assignments[key]:b===undefined?undefined:null;if(value===null&&!state.scopes?.includes(o.scope))value=b;return {...o,value};});const stale=b!==undefined&&obs.some(o=>!state.scopes?.includes(o.scope)&&o.value!==undefined&&!equal(o.value,b));const v=mergeValue(b,obs,ctx,'assignment:'+key,{force:stale});if(v!==undefined)result.assignments[key]=v;}
+  for(const id of new Set([...Object.keys(base?.order||{}),...relevant.flatMap(o=>Object.keys(o.value.order))])){const previous=base?.order?.[id]||[];result.order[id]=mergeValue(previous,relevant.map(o=>({...o,value:!state.scopes?.includes(o.scope)&&!o.value.order[id]?.length?previous:o.value.order[id]||[]})),ctx,'member-order:'+id,{ordered:true})||[];}
+  for(const [key,id]of Object.entries(result.assignments))if(id&&!result.entities[id]){
+    if(result.entities[id]===null){const confirmed=base?.assignments?.[key];result.assignments[key]=confirmed&&result.entities[confirmed]?confirmed:null;continue;}
+    const choices=[{id:'clear',label:'Leave the session ungrouped',value:null},...Object.entries(result.entities).filter(([,g])=>g).map(([id,g])=>({id,label:'Move to '+g.name,value:id}))];const oldGroup=relevant.map(o=>o.value.entities[id]).find(Boolean);if(oldGroup)choices.push({id:'restore',label:'Restore group '+oldGroup.name,value:'__restore'});const chosen=ctx.pick('orphan:'+key,'Assignment references a removed group',key,choices,null);if(chosen==='__restore'){result.entities[id]=clone(oldGroup);result.assignments[key]=id;}else result.assignments[key]=chosen;
+  }
   result.layout=result.layout.filter(id=>result.entities[id]);for(const [id,g]of Object.entries(result.entities))if(g&&!result.layout.includes(id))result.layout.push(id);
+  for(const id of Object.keys(result.order))if(!result.entities[id])delete result.order[id];
   return result;
 }
-function mergeSections(base,observations,ctx){return mergeValue(base,observations.map(o=>({...o,value:normalizeSections(o.value)})),ctx,'sidebar');}
+function mergeSections(base,observations,ctx,groups){
+  const visible=value=>{if(!value||!groups)return value;return {...value,sections:Object.fromEntries(Object.entries(value.sections).filter(([id,s])=>s.kind!=='manual'||groups.entities[id]))};};
+  return mergeValue(visible(base),observations.map(o=>({...o,value:visible(normalizeSections(o.value))})),ctx,'sidebar');
+}
 module.exports={own,clone,stable,hash,equal,plain,label,Context,mergeValue,mergeSession,normalizeGroups,materialGroups,normalizeSections,materialSections,mergeGroups,mergeSections,refs,conversationKeys};

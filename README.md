@@ -110,8 +110,8 @@ A finished merge ends with a summary of what changed where:
 
 **Merging.** claude-x remembers the last merged state. On each run it compares every folder with that state:
 
-- New sessions without saved access settings, and independent metadata changes, merge automatically.
-- Conflicting edits, deletions, stale account copies and incompatible conversation histories need your choice before anything is applied.
+- New sessions without saved access settings, independent metadata edits and compatible group deletions merge automatically.
+- Conflicting edits, session deletions, unexpectedly empty account sidebars and incompatible conversation histories need your choice before anything is applied.
 - A new session with saved access settings shows one confirmation listing all its protected fields. Preserve them exactly, or remove the listed fields from every merged copy, including the source session (removal does not choose a specific permission mode). Structured settings are summarized by counts, never by contents. Access changes to existing sessions need separate confirmations.
 - When two accounts continued the same conversation differently and both conversation files are retrievable, you can keep both as separate sidebar sessions. claude-x never invents a combined transcript.
 - Unattended runs (no terminal) stop when any confirmation is required.
@@ -119,6 +119,8 @@ A finished merge ends with a summary of what changed where:
 **Applying.** claude-x backs up the current state, stages the merged folders and sidebar storage, verifies them, then swaps them in under a journal. If the sidebar storage changed after the preview, it stops before replacing live data; rerun and review the fresh choices. An interrupted run is never left half-applied silently: `claude-x --recover` rolls back to the verified pre-sync state or finishes a run whose replacements all completed.
 
 **Groups.** Custom groups are written to Claude's local sidebar storage for every account folder. Claude uploads them only for the account that is signed in when it reopens online, which is why you run claude-x again after switching accounts. Additions use Claude's own migration merge so groups that exist only in the cloud are kept.
+
+Group changes are compared with the last synced state. Compatible edits merge automatically, including memberships added to existing groups. Confirmed deletions stay deleted when you switch accounts, even if cloud storage returns the old groups and memberships. Known older group names in those stale copies also keep the confirmed name. Sync remembers that history across runs; restoring a backup explicitly can still recover a deleted group. Unknown conflicting changes still need a choice.
 
 ## Backups and restore
 

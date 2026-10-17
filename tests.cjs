@@ -160,7 +160,113 @@ test('custom groups merge independent names/members, ask about assignments and s
   const base=C.normalizeGroups(g());let ctx=new C.Context();const a=g('Renamed'),b=g();b.groups.push({id:'g2',name:'New'});b.assignments['code:'+id(22)]='g2';b.order.g2=['code:'+id(22)];
   const merged=C.mergeGroups(base,scoped(a,b),{scopes:[A,B]},ctx);assert.equal(ctx.conflicts.length,0);assert.equal(merged.entities.g1.name,'Renamed');assert.equal(merged.entities.g2.name,'New');
   ctx=new C.Context();const aa=g(),bb=g();aa.assignments['code:'+sid]='g2';bb.assignments['code:'+sid]='g3';aa.groups.push({id:'g2',name:'A'});bb.groups.push({id:'g3',name:'B'});C.mergeGroups(base,scoped(aa,bb),{scopes:[A,B]},ctx);assert.ok(ctx.conflicts.some(c=>c.id.startsWith('assignment:')));
-  ctx=new C.Context();C.mergeGroups({...base,entities:{g1:null},layout:[]},scoped(g(),empty()),{scopes:[B]},ctx);assert.ok(ctx.conflicts.some(c=>c.id==='group:g1'));
+  ctx=new C.Context();const stale=C.mergeGroups({...base,entities:{g1:null},layout:[]},scoped(g(),empty()),{scopes:[B]},ctx);assert.equal(ctx.conflicts.length,0);assert.equal(stale.entities.g1,null);
+});
+test('compatible group deletions and renames merge once; returning old groups need no decisions',async()=>{
+  const f=await fixture();try{
+    await mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);for(const scope of [A,B]){primary.state.customGroupsByScope[scope].groups.push({id:'g2',name:'Done'});primary.state.codeSidebarByScope[scope]=section(primary.state.customGroupsByScope[scope]);}await db.put(key,S.encode(primary));}});
+    await sync(f.cfg);
+    const current={groups:[{id:'g2',name:'Finished'}],assignments:{['code:'+sid]:'g2'},order:{g2:['code:'+sid]}};
+    await mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);primary.state.customGroupsByScope[A]=current;primary.state.codeSidebarByScope[A]=section(current);await db.put(key,S.encode(primary));}});
+    const x=await scan(f.cfg);try{
+      assert.equal(x.p.conflicts.length,0,JSON.stringify(x.p.conflicts));assert.equal(x.p.groups.entities.g2.name,'Finished');
+      await S.transaction(f.cfg,x.snap,x.state,x.p);
+    }finally{remove(x.snap);}
+    const state=JSON.parse(fs.readFileSync(path.join(f.cfg.data,'state.json')));assert.equal(state.groups.entities.g1,null);assert.equal(state.groups.entities.g2.name,'Finished');
+    const db=await S.readDb(path.join(f.cfg.root,'Local Storage/leveldb'));for(const scope of [A,B])assert.deepEqual(db.primary.state.customGroupsByScope[scope].groups,current.groups);
+    assert.equal(db.entries.get(db.keys.marker).subarray(1).toString('utf16le'),A);
+    const unchanged=await scan(f.cfg);try{assert.equal(unchanged.p.conflicts.length,0);assert.equal(unchanged.p.groupCount,1);assert.equal(unchanged.p.preferenceWrites,0);}finally{remove(unchanged.snap);}
+    await mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);const stale=g();stale.groups.push({id:'g2',name:'Done'});primary.state.customGroupsByScope[A]=stale;await db.put(key,S.encode(primary));}});
+    const stale=await scan(f.cfg);try{assert.equal(stale.p.conflicts.length,0,JSON.stringify(stale.p.conflicts));assert.deepEqual(C.materialGroups(stale.p.groups).groups,current.groups);assert.equal(stale.p.groups.assignments['code:'+sid],'g2');}finally{remove(stale.snap);}
+  }finally{f.cleanup();}
+});
+test('ordinary sync never restores a confirmed deleted group, even when another account still has it',()=>{
+  const base={entities:{g1:null},layout:[],assignments:{['code:'+sid]:null},order:{g1:[]}},observations=scoped(g(),empty()),state={scopes:[A,B]};
+  const ctx=new C.Context();const preview=C.mergeGroups(base,observations,state,ctx);assert.equal(preview.entities.g1,null);
+  assert.equal(ctx.conflicts.length,0);assert.deepEqual(C.materialGroups(preview).groups,[]);assert.equal(preview.assignments['code:'+sid],null);
+});
+test('thirty stale memberships of deleted groups need no decisions; unknown orphans still ask',()=>{
+  const keys=Array.from({length:30},(_,i)=>'code:local_'+id(200+i)),kept={id:'kept',name:'Kept'};
+  const base={entities:{gone:null,kept},layout:['kept'],assignments:Object.fromEntries(keys.map((k,i)=>[k,i===0?'kept':null])),order:{kept:[keys[0]]}};
+  const raw={groups:[kept],assignments:Object.fromEntries(keys.map(k=>[k,'gone'])),order:{gone:keys,kept:[keys[0]]}};
+  assert.deepEqual(C.normalizeGroups(raw,base),base);const ctx=new C.Context(),merged=C.mergeGroups(base,scoped(raw,C.materialGroups(base)),{scopes:[A,B]},ctx);assert.equal(ctx.conflicts.length,0);assert.deepEqual(merged,base);
+  const unknown=C.clone(raw);unknown.assignments[keys[1]]='unknown';const review=new C.Context();C.mergeGroups(base,scoped(unknown,C.materialGroups(base)),{scopes:[A,B]},review);assert.ok(review.conflicts.some(c=>c.id==='orphan:'+keys[1]));
+});
+test('real group conflicts and an unexpectedly empty account still ask; a new folder cannot delete existing groups',()=>{
+  const first={id:'g1',name:'First'},second={id:'g2',name:'Second'},raw={groups:[first,second],assignments:{['code:'+sid]:'g1'},order:{g1:['code:'+sid]}},base=C.normalizeGroups(raw);
+  const removed={groups:[second],assignments:{},order:{}},renamed={...C.clone(raw),groups:[{...first,name:'Different edit'},second]},ctx=new C.Context();C.mergeGroups(base,scoped(removed,renamed),{scopes:[A,B]},ctx);assert.ok(ctx.conflicts.some(c=>c.id==='group:g1'));
+  const emptyScope=new C.Context();C.mergeGroups(base,scoped(empty(),raw),{scopes:[A,B]},emptyScope);assert.ok(emptyScope.conflicts.some(c=>c.id==='group:g1'));
+  const fresh=new C.Context(),extra={groups:[{id:'g3',name:'New'}],assignments:{},order:{}};const imported=C.mergeGroups(base,scoped(raw,extra),{scopes:[A]},fresh);assert.equal(fresh.conflicts.length,0);assert.equal(Object.values(imported.entities).filter(Boolean).length,3);assert.equal(imported.assignments['code:'+sid],'g1');
+});
+test('known old metadata is ignored only in a returning stale copy; unknown conflicting edits still ask',()=>{
+  const old={id:'kept',name:'Old name'},latest={id:'kept',name:'Current name'},gone={id:'gone',name:'Deleted'},base={entities:{gone:null,kept:latest},layout:['kept'],assignments:{},order:{}},state={scopes:[A,B],groupHistory:{kept:[C.hash(old)]}};
+  const stale={groups:[gone,old],assignments:{},order:{}},current=C.materialGroups(base),automatic=new C.Context();assert.equal(C.mergeGroups(base,scoped(stale,current),state,automatic).entities.kept.name,'Current name');assert.equal(automatic.conflicts.length,0);
+  const differentOldOrder=new C.Context();assert.deepEqual(C.mergeGroups(base,scoped(stale,{...stale,groups:[old,gone]}),state,differentOldOrder).layout,['kept']);assert.equal(differentOldOrder.conflicts.length,0);
+  const unknown={...stale,groups:[gone,{...old,name:'Unrecognized change'}]},review=new C.Context();C.mergeGroups(base,scoped(unknown,current),state,review);assert.ok(review.conflicts.some(c=>c.id==='group:kept'));
+  const deliberate=new C.Context(),rename={...current,groups:[old]};assert.equal(C.mergeGroups(base,scoped(rename,current),state,deliberate).entities.kept.name,'Old name');assert.equal(deliberate.conflicts.length,0);
+});
+test('new accounts preserve the confirmed group layout and member order when their ordering is absent or empty',()=>{
+  const first='code:'+sid,second='code:local_'+id(22),existing={groups:[{id:'g1',name:'First'},{id:'g2',name:'Second'}],assignments:{[first]:'g1',[second]:'g1'},order:{g1:[second,first]}},base=C.normalizeGroups(existing);
+  for(const order of [{},{g1:[]}]){
+    const fresh={groups:[{id:'g3',name:'New account group'}],assignments:{},order},ctx=new C.Context(),merged=C.mergeGroups(base,scoped(existing,fresh),{scopes:[A]},ctx);
+    assert.equal(ctx.conflicts.length,0);assert.deepEqual(merged.layout,['g1','g2','g3']);assert.deepEqual(merged.order.g1,[second,first]);assert.deepEqual(merged.assignments,base.assignments);
+    const visible=C.materialSections(null,C.materialGroups(merged),section(existing));assert.deepEqual(visible.sections.find(s=>s.id==='g1').members,[second,first]);
+  }
+});
+test('repeated account switches keep confirmed groups without decisions, even after the older backups expire',async()=>{
+  const f=await fixture();try{
+    const E=id(1)+'/'+id(12),F=id(2)+'/'+id(12),G=id(4)+'/'+id(11),all=[A,B,D,E,F,G];
+    for(const scope of all){fs.mkdirSync(path.join(f.cfg.root,'claude-code-sessions',scope),{recursive:true});writeRow(f.cfg,scope,row());}
+    const full={groups:Array.from({length:9},(_,i)=>({id:'g'+(i+1),name:'Group '+(i+1)})),assignments:{['code:'+sid]:'g1'},order:{g1:['code:'+sid]}};
+    const replace=async(values,active)=>mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);for(const [scope,groups]of Object.entries(values)){primary.state.customGroupsByScope[scope]=C.clone(groups);primary.state.codeSidebarByScope[scope]=section(groups);}if(active)primary.state.lastSidebarScopeKey=active;await db.put(key,S.encode(primary));}if(active)await db.del(Buffer.from('_https://claude.ai\0\x01ccd-sync-pending:ccd/dframe-store','latin1'));});
+    await replace(Object.fromEntries(all.map(s=>[s,full])));await sync(f.cfg);
+    const desired={groups:[full.groups[1],full.groups[3],{...full.groups[5],name:'Combined Done'}],assignments:{['code:'+sid]:'g6'},order:{g6:['code:'+sid]}};
+    await replace({[A]:desired});await sync(f.cfg);
+    const legacyState=JSON.parse(fs.readFileSync(path.join(f.cfg.data,'state.json')));delete legacyState.groupHistory;S.atomic(path.join(f.cfg.data,'state.json'),legacyState);
+    let lastBackup,lastScope;
+    let switchCount=0;for(const scope of [B,E,A,G,F,D,B,A]){
+      const config=JSON.parse(fs.readFileSync(path.join(f.cfg.root,'config.json')));config.lastKnownAccountUuid=scope.split('/')[0];S.atomic(path.join(f.cfg.root,'config.json'),config);
+      const returning=C.clone(full);if(switchCount++%2===1)returning.groups[5].name='Combined Done';await replace({[scope]:returning},scope);
+      const x=await scan(f.cfg);try{assert.equal(x.p.conflicts.length,0,JSON.stringify(x.p.conflicts));assert.deepEqual(C.materialGroups(x.p.groups).groups,desired.groups);assert.equal(x.p.groups.assignments['code:'+sid],'g6');assert.equal(x.p.sessionWrites,0);lastBackup=await S.transaction(f.cfg,x.snap,x.state,x.p);lastScope=scope;}finally{remove(x.snap);}
+      const uploaded=await S.readDb(path.join(f.cfg.root,'Local Storage/leveldb'));assert.equal(uploaded.entries.get(uploaded.keys.marker).subarray(1).toString('utf16le'),scope);
+    }
+    const state=JSON.parse(fs.readFileSync(path.join(f.cfg.data,'state.json')));assert.ok(state.groupHistory.g6.includes(C.hash(full.groups[5])));assert.ok(S.backupList(f.cfg).every(b=>JSON.parse(fs.readFileSync(path.join(b.path,'state-before.json'))).groups.layout.length===3));
+    // Deliberate backup restoration can still recover those nine groups.
+    const x=await scan(f.cfg);try{const fullRestore=await S.restorePlan(f.cfg,x.snap,x.state,lastBackup.id,{['restore:'+lastBackup.id]:'restore'});assert.notEqual(fullRestore.nextState.groups.entities.g1,null);const p=await S.restoreGroupsPlan(f.cfg,x.snap,x.state,lastBackup.id,lastScope,all);assert.equal(p.groupCount,9);assert.equal(Object.values(p.groups.entities).filter(Boolean).length,9);await S.transaction(f.cfg,x.snap,x.state,p);}finally{remove(x.snap);}
+    const restored=await scan(f.cfg);try{assert.equal(restored.p.conflicts.length,0,JSON.stringify(restored.p.conflicts));assert.equal(restored.p.groupCount,9);}finally{remove(restored.snap);}
+  }finally{f.cleanup();}
+});
+test('full snapshot restore explicitly revives a group that ordinary sync keeps deleted',async()=>{
+  const f=await fixture();try{
+    const replace=async values=>mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);for(const [scope,groups]of Object.entries(values)){primary.state.customGroupsByScope[scope]=groups;primary.state.codeSidebarByScope[scope]=section(groups);}await db.put(key,S.encode(primary));}});
+    await sync(f.cfg);await replace({[A]:empty(),[B]:empty()});await sync(f.cfg,{'group:g1':'v0'});
+    await replace({[A]:g()});const b=await sync(f.cfg);
+    const x=await scan(f.cfg);try{assert.equal(x.state.groups.entities.g1,null);const p=await S.restorePlan(f.cfg,x.snap,x.state,b.id,{['restore:'+b.id]:'restore'});assert.equal(p.conflicts.length,0,JSON.stringify(p.conflicts));await S.transaction(f.cfg,x.snap,x.state,p);}finally{remove(x.snap);}
+    const db=await S.readDb(path.join(f.cfg.root,'Local Storage/leveldb'));assert.deepEqual(db.primary.state.customGroupsByScope[A].groups,g().groups);assert.deepEqual(db.primary.state.customGroupsByScope[B].groups,[]);
+    const next=await scan(f.cfg);try{assert.equal(next.p.conflicts.length,0,JSON.stringify(next.p.conflicts));assert.equal(next.p.groupCount,1);}finally{remove(next.snap);}
+  }finally{f.cleanup();}
+});
+test('scoped group restore preserves sessions and other accounts; their acknowledged older groups are not new edits',async()=>{
+  const f=await fixture();try{
+    const full={groups:Array.from({length:9},(_,i)=>({id:'g'+(i+1),name:'Group '+(i+1)})),assignments:{['code:'+sid]:'g1'},order:{g1:['code:'+sid]}};
+    fs.mkdirSync(path.join(f.cfg.root,'claude-code-sessions',D),{recursive:true});writeRow(f.cfg,D,row());
+    const replace=async values=>mutateDb(f.cfg,async db=>{for await(const [key,value]of db.iterator())if(key.toString('latin1').endsWith('\x01dframe-store')){const primary=S.decode(value);for(const [scope,groups]of Object.entries(values)){primary.state.customGroupsByScope[scope]=groups;primary.state.codeSidebarByScope[scope]=section(groups);}await db.put(key,S.encode(primary));}});
+    await replace({[A]:full,[B]:full,[D]:full});await sync(f.cfg);
+    const desired={groups:[full.groups[1],full.groups[3],{...full.groups[5],name:'Combined Done'}],assignments:{['code:'+sid]:'g6'},order:{g6:['code:'+sid]}};
+    await replace({[A]:desired});const saved=await scan(f.cfg);let b;try{b=await S.transaction(f.cfg,saved.snap,saved.state,{...saved.p,conflicts:[],groups:saved.state.groups,sections:saved.state.sections,sessionsByScope:C.clone(saved.snap.records)});}finally{remove(saved.snap);}
+    writeRow(f.cfg,B,row({title:'Today'}));const before=S.tree(f.cfg.root),transcript=S.fileHash(f.transcript);
+    const x=await scan(f.cfg);try{await assert.rejects(S.restoreGroupsPlan(f.cfg,x.snap,x.state,b.id,'invalid',[A,B]),/Source scope/);await assert.rejects(S.restoreGroupsPlan(f.cfg,x.snap,x.state,b.id,A,['invalid']),/existing target/);const p=await S.restoreGroupsPlan(f.cfg,x.snap,x.state,b.id,A,[A,B]);assert.equal(p.sessionWrites,0);assert.deepEqual(p.restoreScopes,[A,B]);assert.equal(p.groupCount,3);await S.transaction(f.cfg,x.snap,x.state,p);}finally{remove(x.snap);}
+    const after=S.tree(f.cfg.root);for(const [file,hash]of Object.entries(before))if(!file.startsWith('Local Storage/leveldb/'))assert.equal(after[file],hash,file);assert.equal(S.fileHash(f.transcript),transcript);
+    const db=await S.readDb(path.join(f.cfg.root,'Local Storage/leveldb'));for(const scope of [A,B]){assert.deepEqual(db.primary.state.customGroupsByScope[scope].groups,desired.groups);assert.deepEqual(db.groups.value[scope].groups,desired.groups);assert.deepEqual(db.primary.state.customGroupsByScope[scope].assignments,desired.assignments);}assert.deepEqual(db.primary.state.customGroupsByScope[D].groups,full.groups);
+    const state=JSON.parse(fs.readFileSync(path.join(f.cfg.data,'state.json')));assert.equal(Object.values(state.groups.entities).filter(g=>g===null).length,6);
+    const next=await scan(f.cfg);try{assert.equal(next.p.groupCount,3);assert.deepEqual(C.materialGroups(next.p.groups).groups,desired.groups);assert.ok(!next.p.conflicts.some(c=>c.id.startsWith('group:')||c.id==='cloud:'+D),JSON.stringify(next.p.conflicts));}finally{remove(next.snap);}
+    // Reopening Claude can retain memberships for absent, already deleted groups
+    // while adding compatible memberships to groups that are still present.
+    const extraSid='local_'+id(22),extraFile=extraSid+'.json',staleKey='code:'+sid;
+    for(const scope of [A,B,D]){writeRow(f.cfg,scope,row({title:'Today'}));fs.writeFileSync(path.join(f.cfg.root,'claude-code-sessions',scope,extraFile),JSON.stringify(row({sessionId:extraSid})));}
+    const stale={...C.clone(desired),assignments:{[staleKey]:'g1'},order:{...desired.order,g1:[staleKey]}},latest=C.clone(stale);latest.assignments['code:'+extraSid]='g2';latest.order.g2=['code:'+extraSid];
+    await replace({[A]:stale,[B]:latest});const reopened=await scan(f.cfg);try{assert.equal(reopened.p.conflicts.length,0,JSON.stringify(reopened.p.conflicts));assert.deepEqual(C.materialGroups(reopened.p.groups).groups,desired.groups);assert.equal(reopened.p.groups.assignments[staleKey],'g6');assert.equal(reopened.p.groups.assignments['code:'+extraSid],'g2');assert.equal(reopened.p.sessionWrites,0);}finally{remove(reopened.snap);}
+  }finally{f.cleanup();}
 });
 test('group comparison ignores stale ordering entries but retains assigned member order',()=>{
   const first='code:'+sid,second='code:local_'+id(22),moved='code:local_'+id(23),removed='code:local_'+id(24);
